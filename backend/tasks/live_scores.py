@@ -252,8 +252,8 @@ async def _crawl_match_events_async():
                     await service.add_match_event(str(match['_id']), event)
                     events_found += 1
 
-                    # Publish event notification
-                    await publish_match_event(str(match['_id']), event)
+                    # Publish event notification with match data
+                    await publish_match_event(str(match['_id']), event, match)
 
                     logger.info(
                         "new_match_event",
@@ -287,56 +287,98 @@ async def _crawl_match_events_async():
 async def publish_match_update(match_id: str, data: dict):
     """
     Publish match update to Redis for WebSocket broadcasting
+    Uses NotificationService for consistent messaging
     """
     try:
         import redis.asyncio as redis
+        from api.services.notification_service import NotificationService
+
         redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-        redis_client = await redis.from_url(redis_url)
+        redis_client = await redis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True
+        )
 
-        message = {
-            "type": "match_update",
-            "channel": f"match:{match_id}",
-            "data": {
-                "match_id": match_id,
-                "score": data.get('score'),
-                "minute": data.get('minute'),
-                "status": data.get('status')
-            }
-        }
+        notification_service = NotificationService(redis_client)
 
-        import json
-        await redis_client.publish(f"match:{match_id}", json.dumps(message))
-        await redis_client.publish("live:all", json.dumps(message))
+        # Serialize the match data for Redis
+        serializable_data = serialize_match_data(data)
+
+        # Publish using NotificationService
+        await notification_service.publish_match_update(
+            match_id=match_id,
+            match_data=serializable_data,
+            update_type="update"
+        )
 
         await redis_client.close()
 
     except Exception as e:
-        logger.error("publish_match_update_failed", error=str(e))
+        logger.error("publish_match_update_failed", match_id=match_id, error=str(e))
 
 
-async def publish_match_event(match_id: str, event: dict):
+async def publish_match_event(match_id: str, event: dict, match_data: dict = None):
     """
     Publish match event (goal, card) to Redis
+    Uses NotificationService for consistent messaging
     """
     try:
         import redis.asyncio as redis
+        from api.services.notification_service import NotificationService
+
         redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-        redis_client = await redis.from_url(redis_url)
+        redis_client = await redis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True
+        )
 
-        message = {
-            "type": event['type'],
-            "channel": f"match:{match_id}",
-            "data": {
-                "match_id": match_id,
-                **event
-            }
-        }
+        notification_service = NotificationService(redis_client)
 
-        import json
-        await redis_client.publish(f"match:{match_id}", json.dumps(message))
-        await redis_client.publish("live:all", json.dumps(message))
+        # Serialize the data
+        serializable_match_data = serialize_match_data(match_data) if match_data else {}
+
+        # Publish using NotificationService
+        await notification_service.publish_match_event(
+            match_id=match_id,
+            event=event,
+            match_data=serializable_match_data
+        )
 
         await redis_client.close()
 
     except Exception as e:
-        logger.error("publish_match_event_failed", error=str(e))
+        logger.error("publish_match_event_failed", match_id=match_id, error=str(e))
+
+
+def serialize_match_data(data: dict) -> dict:
+    """
+    Serialize match data for Redis/JSON transmission
+    Converts ObjectId and datetime objects to strings
+    """
+    if not data:
+        return {}
+
+    serialized = {}
+
+    for key, value in data.items():
+        if key == '_id':
+            # Convert ObjectId to string
+            serialized[key] = str(value)
+        elif isinstance(value, datetime):
+            # Convert datetime to ISO format string
+            serialized[key] = value.isoformat()
+        elif isinstance(value, dict):
+            # Recursively serialize nested dicts
+            serialized[key] = serialize_match_data(value)
+        elif isinstance(value, list):
+            # Serialize list items
+            serialized[key] = [
+                serialize_match_data(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            serialized[key] = value
+
+    return serialized

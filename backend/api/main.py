@@ -12,6 +12,7 @@ from datetime import datetime
 from api.core.config import settings
 from api.core.database import init_db, close_db
 from api.routes import auth, matches, leagues, teams, users, websocket
+from api.background import start_redis_listener, stop_redis_listener
 
 # Configure structured logging
 structlog.configure(
@@ -33,10 +34,27 @@ async def lifespan(app: FastAPI):
     logger.info("application_startup", version=settings.API_VERSION)
     await init_db()
 
+    # Start Redis listener for real-time updates
+    import asyncio
+    redis_listener_task = asyncio.create_task(start_redis_listener())
+    logger.info("redis_listener_task_started")
+
     yield
 
     # Shutdown
     logger.info("application_shutdown")
+
+    # Stop Redis listener
+    await stop_redis_listener()
+
+    # Cancel the listener task if still running
+    if not redis_listener_task.done():
+        redis_listener_task.cancel()
+        try:
+            await redis_listener_task
+        except asyncio.CancelledError:
+            pass
+
     await close_db()
 
 
