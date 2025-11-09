@@ -9,6 +9,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 
 from crawlers.flashscore import FlashScoreCrawler
+from crawlers.validators import transform_for_database
 from api.services.match_service import MatchService
 
 logger = structlog.get_logger()
@@ -54,56 +55,103 @@ def crawl_live_scores(self):
 
 async def _crawl_live_scores_async():
     """
-    Async implementation of live score crawling
+    Async implementation of live score crawling with validation and duplicate detection
     """
     db = get_mongo_db()
     service = MatchService(db)
 
-    # Get current live matches from database
-    live_matches = await service.get_live_matches(limit=100)
+    # Get matches that need updates (live + today's scheduled matches)
+    matches_to_update = await service.get_matches_requiring_updates(limit=100)
 
-    logger.info("live_matches_found", count=len(live_matches))
+    logger.info(
+        "matches_to_update_found",
+        count=len(matches_to_update),
+        live_count=sum(1 for m in matches_to_update if m.get('status') == 'live')
+    )
 
-    if not live_matches:
-        return {"matches_updated": 0}
+    if not matches_to_update:
+        return {
+            "matches_updated": 0,
+            "matches_created": 0,
+            "validation_failures": 0
+        }
 
     # Initialize crawler
     crawler = FlashScoreCrawler()
 
     matches_updated = 0
+    matches_created = 0
+    validation_failures = 0
 
-    # Crawl each live match
-    for match in live_matches:
+    # Crawl each match
+    for match in matches_to_update:
         try:
             external_id = match.get('external_id')
             if not external_id:
+                logger.warning("match_missing_external_id", match_id=str(match.get('_id')))
                 continue
 
             # Crawl match data
-            match_data = await crawler.crawl_match(external_id)
+            raw_match_data = await crawler.crawl_match(external_id)
 
-            if match_data:
-                # Update match in database
-                updated = await service.update_match(
-                    str(match['_id']),
-                    match_data
+            if not raw_match_data:
+                logger.debug("no_data_from_crawler", external_id=external_id)
+                continue
+
+            # Validate and transform data
+            validated_data = transform_for_database(raw_match_data, match)
+
+            if not validated_data:
+                validation_failures += 1
+                logger.error(
+                    "data_validation_failed",
+                    external_id=external_id,
+                    raw_data=raw_match_data
                 )
+                continue
 
-                if updated:
-                    matches_updated += 1
+            # Upsert match with validated data
+            updated_match, is_new = await service.upsert_match(
+                external_id,
+                validated_data
+            )
 
-                    # Publish update via Redis (for WebSocket)
-                    await publish_match_update(str(match['_id']), match_data)
+            if is_new:
+                matches_created += 1
+            else:
+                matches_updated += 1
+
+            # Publish update via Redis (for WebSocket)
+            await publish_match_update(str(updated_match['_id']), validated_data)
+
+            logger.info(
+                "match_crawl_success",
+                match_id=str(updated_match['_id']),
+                external_id=external_id,
+                status=validated_data.get('status'),
+                is_new=is_new
+            )
 
         except Exception as e:
             logger.error(
                 "match_crawl_failed",
-                match_id=match.get('_id'),
-                error=str(e)
+                match_id=str(match.get('_id')),
+                external_id=match.get('external_id'),
+                error=str(e),
+                error_type=type(e).__name__
             )
             continue
 
-    return {"matches_updated": matches_updated}
+    result = {
+        "matches_updated": matches_updated,
+        "matches_created": matches_created,
+        "validation_failures": validation_failures,
+        "total_processed": matches_updated + matches_created + validation_failures
+    }
+
+    logger.info("crawl_live_scores_summary", **result)
+
+    return result
 
 
 @shared_task(bind=True, max_retries=3)
@@ -136,7 +184,7 @@ def crawl_match_events(self):
 
 async def _crawl_match_events_async():
     """
-    Async implementation of match events crawling
+    Async implementation of match events crawling with validation
     """
     db = get_mongo_db()
     service = MatchService(db)
@@ -144,32 +192,62 @@ async def _crawl_match_events_async():
     # Get current live matches
     live_matches = await service.get_live_matches(limit=100)
 
+    logger.info("live_matches_for_events", count=len(live_matches))
+
     if not live_matches:
-        return {"events_found": 0}
+        return {
+            "events_found": 0,
+            "matches_processed": 0
+        }
 
     crawler = FlashScoreCrawler()
     events_found = 0
+    matches_processed = 0
+    validation_errors = 0
 
     for match in live_matches:
         try:
             external_id = match.get('external_id')
             if not external_id:
+                logger.warning("match_missing_external_id", match_id=str(match.get('_id')))
                 continue
 
-            # Crawl events
-            events = await crawler.crawl_match_events(external_id)
+            matches_processed += 1
 
-            # Check for new events
+            # Crawl events
+            raw_events = await crawler.crawl_match_events(external_id)
+
+            if not raw_events:
+                continue
+
+            # Validate events using the validator
+            from crawlers.validators import CrawledEvent
+
+            validated_events = []
+            for event in raw_events:
+                try:
+                    validated = CrawledEvent(**event)
+                    validated_events.append(validated.dict(exclude_none=True))
+                except Exception as e:
+                    validation_errors += 1
+                    logger.error(
+                        "event_validation_failed",
+                        match_id=str(match['_id']),
+                        event=event,
+                        error=str(e)
+                    )
+
+            # Check for new events by comparing with existing
             existing_events = match.get('events', [])
-            existing_event_ids = {
-                f"{e['type']}_{e['minute']}_{e['player']}"
+            existing_event_signatures = {
+                f"{e['type']}_{e['minute']}_{e['player']}_{e['team']}"
                 for e in existing_events
             }
 
-            for event in events:
-                event_id = f"{event['type']}_{event['minute']}_{event['player']}"
+            for event in validated_events:
+                event_signature = f"{event['type']}_{event['minute']}_{event['player']}_{event['team']}"
 
-                if event_id not in existing_event_ids:
+                if event_signature not in existing_event_signatures:
                     # New event found!
                     await service.add_match_event(str(match['_id']), event)
                     events_found += 1
@@ -181,18 +259,29 @@ async def _crawl_match_events_async():
                         "new_match_event",
                         match_id=str(match['_id']),
                         event_type=event['type'],
-                        minute=event['minute']
+                        minute=event['minute'],
+                        player=event['player']
                     )
 
         except Exception as e:
             logger.error(
                 "events_crawl_failed",
-                match_id=match.get('_id'),
-                error=str(e)
+                match_id=str(match.get('_id')),
+                external_id=match.get('external_id'),
+                error=str(e),
+                error_type=type(e).__name__
             )
             continue
 
-    return {"events_found": events_found}
+    result = {
+        "events_found": events_found,
+        "matches_processed": matches_processed,
+        "validation_errors": validation_errors
+    }
+
+    logger.info("crawl_match_events_summary", **result)
+
+    return result
 
 
 async def publish_match_update(match_id: str, data: dict):
