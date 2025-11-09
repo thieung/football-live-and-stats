@@ -33,12 +33,17 @@ class League(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     external_id = Column(String(100), unique=True, index=True)
+    source = Column(String(100), default="manual")  # Data source (flashscore, manual, etc)
     name = Column(String(255), nullable=False)
+    short_name = Column(String(100))  # Short display name
     country = Column(String(100))
+    country_code = Column(String(10))  # ISO country code
     logo_url = Column(String(500))
     season = Column(String(20))  # "2024/2025"
     is_active = Column(Boolean, default=True)
+    is_featured = Column(Boolean, default=False)  # Featured on homepage
     priority = Column(Integer, default=0)  # Display priority
+    num_teams = Column(Integer)  # Number of teams in league
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
@@ -51,8 +56,10 @@ class Team(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     external_id = Column(String(100), unique=True, index=True)
+    source = Column(String(100), default="manual")  # Data source (flashscore, manual, etc)
     name = Column(String(255), nullable=False)
     short_name = Column(String(50))
+    acronym = Column(String(10))  # Team acronym (e.g., MUN, LIV)
     logo_url = Column(String(500))
     country = Column(String(100))
     stadium = Column(String(255))
@@ -69,6 +76,7 @@ class Fixture(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     external_id = Column(String(100), unique=True, index=True)
+    source = Column(String(100), default="manual")  # Data source (flashscore, manual, etc)
     league_id = Column(UUID(as_uuid=True), ForeignKey("leagues.id"), nullable=False)
     home_team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
     away_team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
